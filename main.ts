@@ -16,7 +16,7 @@
 //
 // Node 22, standard library only; no dependencies are installed.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -82,6 +82,34 @@ function humanBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
+// The game must load offline: no game file may pull a script, image, style
+// sheet or module from the network. A single external URL would make the
+// entry fail in the grader's sandbox, so scan every text file the browser
+// can load for one and name the exact file and line that breaks the rule.
+const EXTERNAL_URL = /(?:(?:src|href)\s*=\s*["']|url\(\s*["']?|from\s+["']|import\(\s*["'])\s*https?:\/\//i;
+
+function checkOffline(gameDir: string): void {
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && /\.(html?|js|mjs|css|json)$/i.test(entry.name)) {
+        const lines = readFileSync(full, 'utf8').split('\n');
+        lines.forEach((line, index) => {
+          const match = EXTERNAL_URL.exec(line);
+          if (match) {
+            fail(
+              `${relative(SOURCE_DIR, full)}:${index + 1} references an external URL (${match[0].trim()}…): the game must load offline`,
+            );
+          }
+        });
+      }
+    }
+  };
+  walk(gameDir);
+}
+
 // The game must have its entry page, and must fit the scorer's caps.
 function checkGame(gameDir: string): TreeTotals {
   if (!existsSync(join(gameDir, 'index.html'))) {
@@ -102,7 +130,7 @@ function checkGame(gameDir: string): TreeTotals {
 
 // Screenshots are the judge's first look at the game: 1 to 4 of them, each a
 // JPEG or PNG no bigger than 256 KiB. The first by name is the cover.
-function checkScreenshots(shotsDir: string): { count: number; bytes: number } {
+function checkScreenshots(shotsDir: string): { count: number; bytes: number; names: string[] } {
   if (!existsSync(shotsDir)) {
     fail(`screenshots/ is missing from ${SOURCE_DIR}: the entry needs at least one screenshot`);
   }
@@ -126,13 +154,14 @@ function checkScreenshots(shotsDir: string): { count: number; bytes: number } {
     }
     bytes += size;
   }
-  return { count: names.length, bytes };
+  return { count: names.length, bytes, names };
 }
 
 const gameDir = join(SOURCE_DIR, 'game');
 const shotsDir = join(SOURCE_DIR, 'screenshots');
 
 const gameTotals = checkGame(gameDir);
+checkOffline(gameDir);
 const shotTotals = checkScreenshots(shotsDir);
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -152,8 +181,33 @@ writeFileSync(
   }),
 );
 
+// Read the dossier back and make sure it describes the hand-in we just
+// built: cover 0 (the first screenshot by name) and one image per
+// screenshot file. A mismatch here means the build is corrupt, and failing
+// now beats shipping a dossier the judge cannot read.
+function verifyDossier(path: string, shots: { count: number; names: string[] }): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    fail(`dossier at ${path} is not valid JSON after writing`);
+  }
+  const dossier = parsed as { cover?: unknown; images?: unknown };
+  if (dossier.cover !== 0) {
+    fail(`dossier cover is ${String(dossier.cover)}, expected 0 (first screenshot by name, ${shots.names[0]})`);
+  }
+  if (!Array.isArray(dossier.images) || dossier.images.length !== shots.count) {
+    const got = Array.isArray(dossier.images) ? dossier.images.length : 'no';
+    fail(`dossier holds ${got} images, expected ${shots.count} (one per screenshot file)`);
+  }
+}
+
+verifyDossier(dossierPath, shotTotals);
+
 console.log(`Grand Heist: Sunset City — build complete`);
 console.log(`  output dir:  ${OUTPUT_DIR}`);
 console.log(`  game files:  ${gameTotals.files} files, ${humanBytes(gameTotals.bytes)}`);
+console.log(`  offline:     OK (no external URLs in game/)`);
 console.log(`  screenshots: ${shotTotals.count} files, ${humanBytes(shotTotals.bytes)}`);
+console.log(`  cover:       ${shotTotals.names[0]}`);
 console.log(`  dossier:     ${dossierPath}`);
